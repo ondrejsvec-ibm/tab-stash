@@ -5,6 +5,7 @@ import browser from "webextension-polyfill";
 import {
   AsyncTaskQueue,
   backingOff,
+  computedLazyEq,
   expect,
   filterMap,
   shortPoll,
@@ -15,14 +16,16 @@ import {
 import {trace_fn} from "../util/debug";
 import {logErrorsFrom} from "../util/oops";
 import {EventWiring} from "../util/wiring";
-import type {Position, Tree} from "./tree";
 
-export type Window = {
+import {setPosition, type TreeNode, type TreeParent} from "./tree";
+
+export interface Window extends TreeParent<Window, Tab> {
   readonly id: WindowID;
-  readonly tabs: TabID[];
-};
-export type Tab = {
-  windowId: WindowID;
+  readonly position: undefined;
+  readonly children: Tab[];
+}
+
+export interface Tab extends TreeNode<Window, Tab> {
   id: TabID;
   status: Tabs.TabStatus;
   title: string;
@@ -36,7 +39,7 @@ export type Tab = {
   discarded: boolean;
 
   $selected: boolean;
-};
+}
 
 export type WindowID = number & {readonly __window_id: unique symbol};
 export type TabID = number & {readonly __tab_id: unique symbol};
@@ -58,28 +61,34 @@ const MAX_LOADING_TABS = navigator.hardwareConcurrency ?? 4;
  * We avoid any classes or circular references in the data itself so it is
  * JSON-serializable (for transmission between contexts).
  */
-export class Model implements Tree<Window, Tab> {
+export class Model {
   private readonly windows = new Map<WindowID, Window>();
   private readonly tabs = new Map<TabID, Tab>();
   private readonly tabs_by_url = new Map<OpenableURL, Set<Tab>>();
 
   /** The initial window that this model was opened with (if it still exists). */
-  readonly initialWindow: Ref<WindowID | undefined> = ref();
+  readonly initialWindow: Ref<Window | WindowID | undefined> = ref();
 
   /** The window that currently has the focus (if any). */
-  readonly focusedWindow: Ref<WindowID | undefined> = ref();
+  readonly focusedWindow: Ref<Window | WindowID | undefined> = ref();
 
   /** The "target" window that this model should be for.  Controls for things
    * like which window is shown in the UI, tab selection, etc.  This isn't
    * precisely the same as `focusedWindow`, because it accounts for the fact
    * that the user could tear off the Tab Stash tab into a new window, and yet
    * still want to manage the window that the tab was originally opened in. */
-  readonly targetWindow = computed(
-    () => this.initialWindow.value ?? this.focusedWindow.value,
-  );
+  readonly targetWindow = computed(() => {
+    if (typeof this.initialWindow.value === "object") {
+      return this.initialWindow.value;
+    }
+    if (typeof this.focusedWindow.value === "object") {
+      return this.focusedWindow.value;
+    }
+    return undefined;
+  });
 
   /** The number of selected tabs. */
-  readonly selectedCount = computed(() => {
+  readonly selectedCount = computedLazyEq(() => {
     let count = 0;
     for (const _ of this.selectedItems()) ++count;
     return count;
@@ -197,41 +206,16 @@ export class Model implements Tree<Window, Tab> {
     return this.tabs.get(id as TabID);
   }
 
-  tabsIn(win: Window): Tab[] {
-    return filterMap(win.tabs, cid => this.tab(cid));
-  }
-
-  isParent(node: Window | Tab): node is Window {
-    return "tabs" in node;
-  }
-
-  /** Returns the parent window of the tab, and the index of the tab in that
-   * parent window's .tabs array. */
-  positionOf(tab: Tab): Position<Window> | undefined {
-    const parent = this.window(tab.windowId);
-    if (!parent) return undefined;
-
-    const index = parent.tabs.findIndex(tid => tid === tab.id);
-    // istanbul ignore next -- internal sanity
-    if (index === -1) return undefined;
-
-    return {parent, index};
-  }
-
-  childrenOf(parent: Window): readonly Tab[] {
-    return filterMap(parent.tabs, tid => this.tab(tid));
-  }
-
   /** Returns the active tab in the specified window (or in
    * `this.current_window`, if no window is specified). */
   activeTab(windowId?: WindowID): Tab | undefined {
-    if (windowId === undefined) windowId = this.targetWindow.value;
+    if (windowId === undefined) windowId = this.targetWindow.value?.id;
     if (windowId === undefined) return undefined;
 
     const window = this.window(windowId);
     if (!window) return undefined;
 
-    return filterMap(window.tabs, t => this.tab(t)).filter(t => t.active)[0];
+    return window.children.filter(t => t.active)[0];
   }
 
   /** Returns a reactive set of tabs with the specified URL. */
@@ -315,15 +299,13 @@ export class Model implements Tree<Window, Tab> {
 
     // Unlike browser.bookmarks.move(), browser.tabs.move() behaves the same
     // on both Firefox and Chrome.
-    if (tab.windowId === toWindow) {
-      const position = this.positionOf(tab);
-      if (position && toIndex > position.index) toIndex--;
-    }
+    const pos = tab.position;
+    if (pos?.parent.id === toWindow && toIndex > pos.index) toIndex--;
 
     trace("moving tab", id, {toWindow, toIndex});
     await browser.tabs.move(id, {windowId: toWindow, index: toIndex});
     await shortPoll(() => {
-      const pos = this.positionOf(tab);
+      const pos = tab.position;
       if (!pos) tryAgain();
       if (pos.parent.id !== toWindow || pos.index !== toIndex) tryAgain();
     });
@@ -355,25 +337,21 @@ export class Model implements Tree<Window, Tab> {
 
     // NOTE: We expect there to be at most one active tab per window.
     for (const active_tab of active_tabs) {
-      const win = expect(
-        this.window(active_tab.windowId),
-        () => `Couldn't find parent window for active tab ${active_tab.id}`,
+      const pos = expect(
+        active_tab.position,
+        () => `Couldn't find position of active tab ${active_tab.id}`,
       );
-      const tabs_in_window = filterMap(win.tabs, t => this.tab(t)).filter(
-        t => !t.hidden && !t.pinned,
-      );
+      const win = pos.parent;
+      const tabs_in_window = win.children.filter(t => !t.hidden && !t.pinned);
       const closing_tabs_in_window = closing_tabs.filter(
-        t => t.windowId === active_tab.windowId,
+        t => t.position?.parent === active_tab.position?.parent,
       );
 
       if (closing_tabs_in_window.length >= tabs_in_window.length) {
         // If we are about to close all visible tabs in the window, we
         // should open a new tab so the window doesn't close.
-        trace("creating new empty tab in window", active_tab.windowId);
-        await browser.tabs.create({
-          active: true,
-          windowId: active_tab.windowId,
-        });
+        trace("creating new empty tab in window", win.id);
+        await browser.tabs.create({active: true, windowId: win.id});
       } else {
         // Otherwise we should make sure the currently-active tab isn't
         // a tab we are about to hide/discard.  The browser won't let us
@@ -386,10 +364,6 @@ export class Model implements Tree<Window, Tab> {
         // from, to mimic the browser's behavior when closing the front
         // tab.
 
-        const pos = expect(
-          this.positionOf(active_tab),
-          () => `Couldn't find position of active tab ${active_tab.id}`,
-        );
         let candidates = tabs_in_window.slice(pos.index + 1);
         let focus_tab = candidates.find(
           t => t.id !== undefined && !tabIds.find(id => t.id === id),
@@ -425,7 +399,11 @@ export class Model implements Tree<Window, Tab> {
     const wid = win.id as WindowID;
     let window = this.windows.get(wid);
     if (!window) {
-      window = reactive({id: wid, tabs: []});
+      window = reactive({
+        id: wid,
+        position: undefined,
+        children: [],
+      } as Window);
       this.windows.set(wid, window);
     }
     trace("event windowCreated", win.id, win);
@@ -433,14 +411,29 @@ export class Model implements Tree<Window, Tab> {
     if (win.tabs !== undefined) {
       for (const t of win.tabs) this.whenTabCreated(t);
     }
+
+    // HACK: If we know the window ID, but not the window object, for the
+    // initial window, we must update here, otherwise reactive effects that
+    // depend on the contents of the initialWindow will never happen.  Same goes
+    // for focusedWindow.
+    if (window.id === this.initialWindow.value) {
+      this.initialWindow.value = window;
+    }
+    if (window.id === this.focusedWindow.value) {
+      this.focusedWindow.value = window;
+    }
+
     return window;
   }
 
   whenWindowFocusChanged(winId: number) {
-    this.focusedWindow.value =
-      winId !== browser.windows.WINDOW_ID_NONE
-        ? (winId as WindowID)
-        : undefined;
+    if (winId === browser.windows.WINDOW_ID_NONE) {
+      this.focusedWindow.value = undefined;
+      return;
+    }
+
+    const win = this.window(winId);
+    this.focusedWindow.value = win ?? (winId as WindowID);
   }
 
   whenWindowRemoved(winId: number) {
@@ -448,13 +441,15 @@ export class Model implements Tree<Window, Tab> {
     trace("event windowRemoved", winId, win);
     if (!win) return;
 
-    if (this.initialWindow.value === winId)
+    if (this.initialWindow.value === winId) {
       this.initialWindow.value = undefined;
-    if (this.focusedWindow.value === winId)
+    }
+    if (this.focusedWindow.value === winId) {
       this.focusedWindow.value = undefined;
+    }
 
     // We clone the array to avoid disturbances while iterating
-    for (const t of Array.from(win.tabs)) this.whenTabRemoved(t);
+    for (const t of Array.from(win.children)) this.whenTabRemoved(t.id);
     this.windows.delete(winId as WindowID);
   }
 
@@ -472,7 +467,7 @@ export class Model implements Tree<Window, Tab> {
     if (!t) {
       // CAST: Tabs.Tab says the id should be optional, but it isn't...
       t = reactive({
-        windowId: tab.windowId as WindowID,
+        position: undefined,
         id: tab.id as TabID,
         status: (tab.status as Tabs.TabStatus) ?? "loading",
         title: tab.title ?? "",
@@ -486,18 +481,12 @@ export class Model implements Tree<Window, Tab> {
         discarded: tab.discarded ?? false,
 
         $selected: false,
-      });
+      } satisfies Tab);
       this.tabs.set(tab.id as TabID, t);
     } else {
-      // Remove this tab from its prior position
-      if (this.windows.get(tab.windowId as WindowID)) {
-        const pos = this.positionOf(t);
-        if (pos) pos.parent.tabs.splice(pos.index, 1);
-      }
       this._remove_url(t);
       if (t.status === "loading") --this.loadingCount.value;
 
-      t.windowId = tab.windowId as WindowID;
       t.status = (tab.status as Tabs.TabStatus) ?? "loading";
       t.title = tab.title ?? "";
       t.url = tab.url ?? "";
@@ -514,10 +503,14 @@ export class Model implements Tree<Window, Tab> {
     const wid = tab.windowId as WindowID;
     let win = this.windows.get(wid);
     if (!win) {
-      win = reactive({id: wid, tabs: []});
-      this.windows.set(wid, win);
+      win = this.whenWindowCreated({
+        id: tab.windowId,
+        focused: false,
+        incognito: false,
+        alwaysOnTop: false,
+      });
     }
-    win.tabs.splice(tab.index, 0, tab.id as TabID);
+    setPosition(t, {parent: win, index: tab.index});
 
     // Insert the tab in its index
     this._add_url(t);
@@ -573,9 +566,6 @@ export class Model implements Tree<Window, Tab> {
       return;
     }
 
-    const oldPos = this.positionOf(t);
-    if (oldPos) oldPos.parent.tabs.splice(oldPos.index, 1);
-
     let newWindow = this.window(info.windowId as WindowID);
     if (!newWindow) {
       // Sometimes Firefox sends tabAttached (aka tabMoved) events before
@@ -593,8 +583,8 @@ export class Model implements Tree<Window, Tab> {
         alwaysOnTop: false,
       });
     }
-    t.windowId = info.windowId as WindowID;
-    newWindow.tabs.splice(info.toIndex, 0, t.id);
+
+    setPosition(t, {parent: newWindow, index: info.toIndex});
   }
 
   whenTabReplaced(newId: number, oldId: number) {
@@ -604,9 +594,6 @@ export class Model implements Tree<Window, Tab> {
       console.warn(`Got replace event for unknown tab ${oldId} (-> ${newId})`);
       return;
     }
-
-    const pos = this.positionOf(t);
-    if (pos) pos.parent.tabs[pos.index] = newId as TabID;
 
     t.id = newId as TabID;
     this.tabs.delete(oldId as TabID);
@@ -624,7 +611,7 @@ export class Model implements Tree<Window, Tab> {
     // Chrome doesn't tell us which tab was deactivated, so we have to
     // find it and mark it deactivated ourselves...
     const win = this.window(info.windowId as WindowID);
-    if (win) for (const t of this.tabsIn(win)) t.active = false;
+    if (win) for (const t of win.children) t.active = false;
 
     tab.active = true;
   }
@@ -637,7 +624,7 @@ export class Model implements Tree<Window, Tab> {
       return;
     }
 
-    for (const t of this.tabsIn(win)) {
+    for (const t of win.children) {
       t.highlighted = info.tabIds.findIndex(id => id === t.id) !== -1;
     }
   }
@@ -647,12 +634,12 @@ export class Model implements Tree<Window, Tab> {
     const t = this.tabs.get(tabId as TabID);
     if (!t) return; // tab is already removed
 
-    const pos = this.positionOf(t);
+    const pos = t.position;
+    setPosition(t, undefined);
 
     trace("event ...tabRemoved", tabId, pos);
 
     this.tabs.delete(t.id);
-    if (pos) pos.parent.tabs.splice(pos.index, 1);
     this._remove_url(t);
     if (t.status === "loading") --this.loadingCount.value;
   }
@@ -703,33 +690,28 @@ export class Model implements Tree<Window, Tab> {
     // We only allow tabs in the current window to be selected
     // istanbul ignore if -- shouldn't occur in tests
     if (this.targetWindow.value === undefined) return;
-
-    const win = this.window(this.targetWindow.value);
-    if (!win) return;
-
-    for (const t of this.tabsIn(win)) if (t.$selected) yield t;
+    for (const t of this.targetWindow.value.children) if (t.$selected) yield t;
   }
 
   itemsInRange(start: Tab, end: Tab): Tab[] | null {
     // istanbul ignore if -- shouldn't occur in tests
     if (this.targetWindow.value === undefined) return null;
-    if (start.windowId !== this.targetWindow.value) return null;
-    if (end.windowId !== this.targetWindow.value) return null;
 
-    const win = this.window(this.targetWindow.value);
-    if (!win) return null;
-
-    let startPos = this.positionOf(start);
-    let endPos = this.positionOf(end);
-
+    const win = this.targetWindow.value;
+    let startPos = start.position;
+    let endPos = end.position;
     if (!startPos || !endPos) return null;
+
+    if (startPos.parent !== this.targetWindow.value) return null;
+    if (endPos.parent !== this.targetWindow.value) return null;
+
     if (endPos.index < startPos.index) {
       const tmp = endPos;
       endPos = startPos;
       startPos = tmp;
     }
 
-    return this.tabsIn(win)
+    return win.children
       .slice(startPos.index, endPos.index + 1)
       .filter(t => !t.hidden && !t.pinned);
   }

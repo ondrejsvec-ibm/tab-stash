@@ -11,14 +11,21 @@ import type {RootHookObject} from "mocha";
   browser: true,
   events: true,
 };
-(<any>globalThis).browser = {};
+(<any>globalThis).browser = {
+  // Keep the polyfill happy
+  runtime: {
+    id: "mock",
+  },
+};
 (<any>globalThis).navigator = {
   // We provide a fake number here so that tests are always run consistently
   hardwareConcurrency: 4,
 };
 
+// Keep the polyfill happy
+(<any>globalThis).chrome = (<any>globalThis).browser;
+
 // Mock indexedDB.* APIs
-import {IDBFactory} from "fake-indexeddb";
 import "fake-indexeddb/auto";
 
 // Mock WebExtension APIs
@@ -30,7 +37,7 @@ import * as mock_browser from "./browser";
 // Reset the mocks before each test, and make sure all events have drained after
 // each test.
 export const mochaHooks: RootHookObject = {
-  async beforeEach() {
+  beforeEach() {
     (<any>globalThis).indexedDB = new IDBFactory();
     events.beforeTest();
     mock_browser.runtime.reset();

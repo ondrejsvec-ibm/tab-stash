@@ -1,3 +1,10 @@
+<!--
+  NOTE: This is the single most widely-used component in Tab Stash, so it's
+  important to keep it as simple and fast to render as possible.  There are
+  several situations (e.g. searching) where we will re-render every single
+  bookmark in the tree, and we need to do so very quickly.
+-->
+
 <template>
   <div
     :class="{
@@ -19,12 +26,13 @@
         'forest-icon': true,
         action: true,
         select: true,
-        'icon-tab': !bookmark.unfiltered.$selected,
-        'icon-tab-selected-inverse': bookmark.unfiltered.$selected,
       }"
+      default-icon="tab"
       :src="
         !bookmark.unfiltered.$selected ? favicon?.value?.favIconUrl || '' : ''
       "
+      selectable
+      :selected="bookmark.unfiltered.$selected"
       @click.prevent.stop="select"
     />
 
@@ -49,7 +57,11 @@
       @done="isRenaming = false"
     />
 
-    <nav v-if="!isRenaming" class="action-group forest-toolbar">
+    <nav
+      v-memo="[isRenaming]"
+      v-if="!isRenaming"
+      class="action-group forest-toolbar"
+    >
       <a
         class="action rename"
         title="Rename"
@@ -78,13 +90,17 @@ import {defineComponent, type PropType} from "vue";
 import {altKeyName, bgKeyName, bgKeyPressed, required} from "../util";
 
 import type {Model} from "../model";
-import type {Bookmark} from "../model/bookmarks";
+import type {Bookmark, Folder, Node} from "../model/bookmarks";
 import type {FaviconEntry} from "../model/favicons";
 import type {FilteredChild} from "../model/filtered-tree";
 import type {Tab} from "../model/tabs";
 
 import AsyncTextInput from "../components/async-text-input.vue";
 import ItemIcon from "../components/item-icon.vue";
+
+export type FilteredBookmark = FilteredChild<Folder, Node> & {
+  readonly unfiltered: Bookmark;
+};
 
 type RelatedTabState = {
   open: boolean;
@@ -100,7 +116,7 @@ export default defineComponent({
   inject: ["$model"],
 
   props: {
-    bookmark: required(Object as PropType<FilteredChild<Bookmark>>),
+    bookmark: required(Object as PropType<FilteredBookmark>),
   },
 
   computed: {
@@ -112,7 +128,7 @@ export default defineComponent({
       const target_window = tab_model.targetWindow.value;
       return Array.from(
         tab_model.tabsWithURL(this.bookmark.unfiltered.url),
-      ).filter(t => t.windowId === target_window);
+      ).filter(t => t.position?.parent.id === target_window);
     },
 
     related_container_color(): string | undefined {

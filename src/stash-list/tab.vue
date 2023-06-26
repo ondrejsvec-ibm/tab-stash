@@ -20,10 +20,11 @@
         'forest-icon': true,
         action: true,
         select: true,
-        'icon-tab': !tab.unfiltered.$selected,
-        'icon-tab-selected-inverse': tab.unfiltered.$selected,
       }"
+      default-icon="tab"
       :src="favIcon"
+      selectable
+      :selected="tab.unfiltered.$selected"
       @click.prevent.stop="select"
     />
 
@@ -70,7 +71,7 @@ import type {Model} from "../model";
 import {friendlyFolderName} from "../model/bookmarks";
 import type {Container} from "../model/containers";
 import type {FilteredChild} from "../model/filtered-tree";
-import type {Tab} from "../model/tabs";
+import type {Tab, Window} from "../model/tabs";
 
 import ItemIcon from "../components/item-icon.vue";
 
@@ -80,13 +81,13 @@ export default defineComponent({
   inject: ["$model"],
 
   props: {
-    tab: required(Object as PropType<FilteredChild<Tab>>),
+    tab: required(Object as PropType<FilteredChild<Window, Tab>>),
   },
 
   computed: {
     altKey: altKeyName,
     bgKey: bgKeyName,
-    targetWindow(): number | undefined {
+    targetWindow(): Window | undefined {
       return this.model().tabs.targetWindow.value;
     },
     favIcon(): string {
@@ -110,7 +111,7 @@ export default defineComponent({
     isActive(): boolean {
       return (
         this.tab.unfiltered.active &&
-        this.tab.unfiltered.windowId === this.targetWindow
+        this.tab.unfiltered.position?.parent === this.targetWindow
       );
     },
     stashedIn(): string[] {

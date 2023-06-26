@@ -40,9 +40,9 @@ export class SvcRegistry {
       return not_implemented();
     };
     nport.onNotify = msg => {
+      // istanbul ignore else
       if (svc.onNotify) svc.onNotify(nport, msg);
-      /* istanbul ignore else */ else if (svc.onRequest)
-        svc.onRequest(nport, msg);
+      else if (svc.onRequest) svc.onRequest(nport, msg);
     };
 
     trace(`[listener] Accepted connection for ${port.name} as ${nport.name}`);
@@ -83,7 +83,7 @@ export class Port<S extends Send, R extends Send> implements NanoPort<S, R> {
   }
 
   readonly name: string;
-  defaultTimeoutMS = 10000;
+  defaultTimeoutMS = 30000;
 
   onDisconnect?: (port: NanoPort<S, R>) => void;
   onRequest?: (msg: R) => Promise<S>;
@@ -176,6 +176,7 @@ export class Port<S extends Send, R extends Send> implements NanoPort<S, R> {
     for (const [tag, pending] of this.pending) {
       this._trace("flush on disconnect", tag);
       pending.reject(new NanoDisconnectedError(this.name, tag));
+      clearTimeout(pending.timeout_id);
     }
     this.pending.clear();
   }
@@ -226,6 +227,7 @@ export class Port<S extends Send, R extends Send> implements NanoPort<S, R> {
     const handler = this.pending.get(msg.tag);
     if (!handler) return;
 
+    clearTimeout(handler.timeout_id);
     if ("response" in msg) {
       handler.resolve(msg.response);
     } else {
