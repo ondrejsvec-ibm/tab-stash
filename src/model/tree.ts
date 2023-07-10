@@ -24,6 +24,11 @@ export interface TreePosition<
   index: number;
 }
 
+/** The type of a function that checks if the node is a TreeParent or not. */
+export type IsParentFn<P extends TreeParent<P, N>, N extends TreeNode<P, N>> = (
+  node: P | N,
+) => node is P;
+
 /** Check if `child` is contained, directly or indirectly, by `parent`. Children
  * are considered to contain themselves, so if `child === parent`, this returns
  * true. */
@@ -109,4 +114,15 @@ export function setPosition<
 
     child.position = newPosition;
   }
+}
+
+/** Calls a function for each node in a subtree, starting from the root.
+ * Traversal is done pre-order, depth-first. */
+export function forEachNodeInSubtree<
+  P extends TreeParent<P, N>,
+  N extends TreeNode<P, N>,
+>(subtree: P | N, isParent: IsParentFn<P, N>, f: (node: P | N) => void) {
+  f(subtree);
+  if (!isParent(subtree)) return;
+  for (const c of subtree.children) forEachNodeInSubtree(c, isParent, f);
 }
